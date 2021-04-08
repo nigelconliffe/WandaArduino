@@ -3,6 +3,7 @@
  * 
  * This sketch drives the on-board motor-control arduino.
  * 
+ * V1.3   Hooked up I2C processing witpreliminary motor control
  */
 #include <Servo.h>
 #include <Wire.h>
@@ -11,236 +12,298 @@
  * Keep track of which version of the motor control program is running.
  * We may send this to the master as part of a data response.
  */
-#define VERSION 00
+const uint8_t MAJOR = 1;
+const uint8_t MINOR = 3;
+
+/*
+ * For debugging, the speed of the serial connecion
+ */
+const uint32_t  SERIAL_SPEED = 115200;
 
 /*
  * I2C address
  */
-#define SLAVE_ADDRESS 0x10
+const uint8_t  DEVICE_ADDRESS = 0x10;
 
 /*
  * Motor Stuff (related to specific UNO board in the robot
  */
 // Turns out MOTOR 1 is RIGHT and MOTOR 2 is LEFT
-#define  LEFT_MOTOR  6
-#define  RIGHT_MOTOR 5
+const uint8_t   LEFT_MOTOR = 6;
+const uint8_t   RIGHT_MOTOR= 5;
 
 // this is the pin for int 0
-#define LEFT_ENCODER  2
+const uint8_t  LEFT_ENCODER = 2;
 // this is the pin for int 1   
-#define RIGHT_ENCODER 3
+const uint8_t  RIGHT_ENCODER = 3;
 
- 
 //
 // Empirically the limit seems to be:
 //  Full reverse = 140
 //  Full forward =  50
-//  Midpoint = 90 seems to work well
-#define FULL_SPEED  45
-#define NORMAL_SPEED 30
-#define SLOW_SPEED 15
-#define CREEP_SPEED 10
+//  Midpoint = 92 seems to work well
+const uint8_t FAST_SPEED = 45;
+const uint8_t NORMAL_SPEED = 30;
+const uint8_t SLOW_SPEED = 15;
+const uint8_t CREEP_SPEED = 10;
+const uint8_t OFF = 92;
 
-#define OFF 92
+/*
+ * Map throttle "speeds" to actual throttle values
+ * Order is
+ *   CREEP, SLOW, NORMAL, FAST
+ */
+const uint8_t THROTTLE_TABLE_SIZE = 4;
+const uint8_t REVERSE[THROTTLE_TABLE_SIZE] = {
+  OFF-CREEP_SPEED, OFF-SLOW_SPEED, 
+  OFF-NORMAL_SPEED, OFF-FAST_SPEED};
 
+const uint8_t FORWARD[THROTTLE_TABLE_SIZE] = {
+  OFF+CREEP_SPEED, OFF+SLOW_SPEED, 
+  OFF+NORMAL_SPEED, OFF+FAST_SPEED}; 
+ 
 /*
  * Motors actually appear as servos to the Arduiino
  */
 Servo leftMotor;
 Servo rightMotor;
 
-volatile unsigned long motorLeftCount;
-volatile unsigned long motorRightCount;
+/*
+ * This data structure holds the current throttle settings and 
+ * motor encoder counts.  Organized like this so it can be passed
+ * to the ROSPI as an I2C request
+ */
 
+struct MotorDataStruct{
 volatile uint8_t  leftThrottle;
 volatile uint8_t  rightThrottle;
+volatile uint32_t motorLeftCount;
+volatile uint32_t motorRightCount;
+uint16_t  i2cmcVersion;
+} motorData;
 
 /*
- * Command definitions
- * 
- * Commands consost of a command Direction and a Modifier.
- * Passed in a single byte, the format is
- * ssmmsddd 
- *   - s = spare
- *   - m = modifier
- *   - d = direction
- *   
- * Special note: 0x00  (all zeros) is *always* a stop command
+ * Maybe this should be a union???
  */
-// COMMAND (bits ....dddd)
-const uint8_t STOP = 0x00;
+char*  writeBuffer = (char*)&motorData;
 
-const uint8_t FORWARD  = 0x01;
-const uint8_t REVERSE  = 0x02;
-
-const uint8_t LEFT = 0x05;
-const uint8_t RIGHT= 0x06;
-
-/*
- * Raw mode passes the throttle settings as a param
- */
-const uint8_t RAW  = 0x08;
-
-// MODIFIERS - SPEED (bits ..mm....)
-const uint8_t CREEP  = 0x00;
-const uint8_t SLOW   = 0x10;
-const uint8_t NORMAL = 0x20;
-const uint8_t FAST   = 0x30;
-
-// MODIFIERS - TURN (bits ..mm....) [TBD]
-
-// MASKS
-const uint8_t COMMAND = 0x0f;
-const uint8_t MODIFIERS = 0x30;
-
-/*
- * FOrward and reverse values, indexed by the speed modifier.
- * These are the actual values sent to the motors (servoes).
- * Forward speeds are in the range 40-90, and
- * reverse speeds are in the range 90-140 or so
- */
-const uint8_t SPEED_FORWARD[] = {
-  OFF-CREEP_SPEED,      // creep
-  OFF-SLOW_SPEED,       // slow
-  OFF-NORMAL_SPEED,     // normal
-  OFF-FULL_SPEED        // fast
-};
-const uint8_t SPEED_REVERSE[] = {
-  OFF+CREEP_SPEED,      // creep
-  OFF+SLOW_SPEED,       // slow
-  OFF+NORMAL_SPEED,     // normal
-  OFF+FULL_SPEED        // fast
-};
-
-/*
- * Command processing flags
- */
-bool measuring;         // running a command which exists for a distance
-uint16_t  distance;     // and how far we have to go
-
-/*
- * Timing stuff
- */
-uint16_t RESPONSE_DELAY = 500;    // haqlf-second between responses
-unsigned long eventTime;
 
 //-------------------------------------------------------------------------------------------
+
+char debugText[60];
 
 void setup () {
   motorSetup();
 
-  // clear all flags
-  measuring = false;
+  motorData.i2cmcVersion = MAJOR<<8 + MINOR;
 
-  // and set the event timer 
-  eventTime = millis() + RESPONSE_DELAY;
-  
   // initialize digital pin RED as an output.
-  // We will use this to indicate activity
+  // We will use this to indicate an error
   pinMode(LED_BUILTIN, OUTPUT);
   digitalWrite(LED_BUILTIN, LOW);
   
   // initialize serial communication 
-  Serial.begin(115200);
-  Serial.println("----------------------");
-  Serial.print("I2CMC Responding to address: ");
-  Serial.println(SLAVE_ADDRESS, HEX);
+  Serial.begin(SERIAL_SPEED);
+  sprintf(debugText, "\n------------------\nI2C MC V%d.%d responding to address: %x",MAJOR, MINOR, 
+        DEVICE_ADDRESS);
+  Serial.println(debugText);
 
   // Initialize I2C  
   Wire.onReceive(receiveData);
-  Wire.onRequest(sendData);
-  Wire.begin(SLAVE_ADDRESS);
+  Wire.onRequest(sendMotorData);
+  Wire.begin(DEVICE_ADDRESS);
 }
 
 /*
- * Main loop does several things
- *  - if we are measuring distance gone (measuring == true) then check to see 
- *    whether we have gone further than the distance requested, and if so STOP
- *   - every so often, calls writeResponse to publish an updated status message
- *  - More as things get more complicated
+ * ********* Command Processing *********
+ */
+uint8_t  command = 255;       // command sent from ROSPI
+uint8_t  param8;              // 8 or 16-bit parameter depending on command
+uint16_t param16;
+ 
+/*
+ Main loop simply decodes commands and sets the motor power accordingly.
+ The command and param8/16 values are set asynchronously by the I2C receiveData
+ routine below. 
+ A command of 255 is a NOP
  */
 void loop () {
-  // ***   MAIN EVENT LOOP START
-
-  // are we measuring how far we have gone?
-  if ((measuring) && (motorLeftCount >= distance)) {
-    // this is the same code as the case STOP action below
-    measuring = false;
-    setSpeeds(OFF);   
-  };
-
-  //** MAIN EVENT LOOP END
-}
-
-void commandProc(uint8_t command, uint8_t modifier, int distance) { 
-  char buf[30];
+  digitalWrite(LED_BUILTIN, LOW);
   switch(command) {
-    case STOP :
-      measuring = false;
+  case 255:
+      /* NOP command. Do nothing*/
+      break;
+
+  case 0:
+      /*  STOP command. 
+       *  Send off to both motors 
+       */
       setSpeeds(OFF);
       break;
-      
-    case FORWARD:
-      motorLeftCount = 0;
-      motorRightCount = 0;
-      measuring = true;
-      setSpeeds(SPEED_FORWARD[modifier]);
+
+  case 1:
+     /*  RAW command. 
+      *  Unpack the individual throttle settings
+      *  and send to both motors
+      */
+      setSpeeds((param16 >> 8),(param16 & 255));
       break;
 
-    case REVERSE:
-      motorLeftCount = 0;
-      motorRightCount = 0;
-      measuring = true;
-      setSpeeds(SPEED_REVERSE[modifier]);
-      break;
+  case 2:
+    /*  FORWARD command
+     *   param8 contains the throttle setting
+     */
+     if (param8 <= THROTTLE_TABLE_SIZE)   setSpeeds(FORWARD[param8]);
+     else   digitalWrite(LED_BUILTIN, HIGH);      // turn on error light
+     break;
 
-//    case RAW:
-//      motorLeftCount = 0;
-//      motorRightCount = 0;
-//      uint8_t right = cmd.param1 & 0xFF;
-//      uint8_t left  = cmd.param1 >> 8;
-//      setSpeeds(left, right);
-//      break;
+ case 3:
+   /*  REVERSE command
+    *   param8 contains thethrottle setting
+    */
+     if (param8 <= THROTTLE_TABLE_SIZE)  setSpeeds(REVERSE[param8]);
+     else   digitalWrite(LED_BUILTIN, HIGH);      // turn on error light
+     break;
 
-    default:
-      sprintf(buf,"Unprocessed command %X", command);
+ default:
+   /*
+    * Here, it's an invaliud command
+    * 
+    * NEED BETTER ERROR HANDLING SOMEHOW
+    */
+     digitalWrite(LED_BUILTIN, HIGH);      // turn on error light   
   }
+  // now set the command byte back to NOP
+  command = 255;
 }
 
 /*
- * This section of the program handles I2C communication 
- * with the host
+ * Debug routine to print out the motor left and right counts
  */
-// ** DUMMY DATA FOR NOW **
-byte data[] = {1,22,3,44,5, 66, 7, 98};
-int ptr = 0;
-const byte LENGTH = 8;
-// ************************
-void receiveData(int bytecount)
-{
-  Serial.print(bytecount); Serial.print(" ");
-  for (int i = 0; i < bytecount; i++) {
-    uint8_t data_to_echo = Wire.read();
-    Serial.print(data_to_echo, HEX); Serial.print(" ");
-  }
-  Serial.println();
+void printCounts() {
+  char line[40];
+  sprintf(line,"Counts  %d  %d", motorData.motorLeftCount, motorData.motorRightCount);
+  Serial.println(line);
 }
 
-void sendData()
+/*
+ * ************************************
+ * I2C communication with ROSPI
+ * ************************************
+ */
+
+ /*
+  * Keep track ofthe reads and writes.
+  * Probably won't need more than 65535 :)
+  */
+uint16_t  reads = 0;
+uint16_t  writes = 0;
+
+/*
+ * This is part of the ReadReg implementation.rTR will hold the
+ * number of teh register to be sent to the host on the next read
+ * request.
+ * 
+ * The value 255 is a nonsense value, which indicates that no  
+ * register number has been received.
+ */
+uint8_t  registerToRead = 255;
+
+/*
+ * Prepare to read either one or two bytes from the stream
+ */
+union {
+  byte rbyte[2];
+  int  received;
+} readBuffer;
+int readPtr = 0;
+
+/*
+ * This responds to the WriteReg8 and WriteReg16 methods in WiringPi.
+ * Action is to read the register number (first byte) and then the next
+ * one or two bytes depending on whether it's an 8 or 16 bit write from
+ * the host.
+ * 
+ * For the motor control module, we are using the register number as the
+ * command, as described above.
+ */
+void receiveData(int bytecount)
 {
- // delay(100);
-  Wire.write(data[ptr]);
-  ptr++;
-  if (ptr>= LENGTH) ptr = 0;
+  sprintf(debugText, "R: %d: %d:", reads, bytecount);
+  Serial.print(debugText);
+  uint8_t  reg;
+  switch(bytecount) {
+  case 3:
+    // 16-bit register write.  First byte is the register, next two are the data
+    command = Wire.read();
+    readBuffer.rbyte[0] = Wire.read();
+    readBuffer.rbyte[1] = Wire.read();
+    param16 = readBuffer.received;
+    sprintf(debugText, "Reg [%d] %x", command, param16);
+    Serial.println(debugText);
+    break;
+   
+  case 2:
+    // 8-bit register write.  First byte is the register, second is the data.
+    command = Wire.read();
+    param8 = Wire.read();
+    sprintf(debugText, "Reg [%d] %x", command, param8);
+    Serial.println(debugText);
+    break;
+
+  case 1:
+    /*
+     * This is a special case;  If the ROSPI issues a ReadReg call, then
+     * the master will send a single byte (the register number) before issuing 
+     * a read to collect the contents of that register.
+     */
+    reg = Wire.read();
+    registerToRead = reg;
+    sprintf(debugText, "Reg [%d] read request?", reg);
+    Serial.println(debugText);
+    break;
+    
+  default:
+    Serial.print("Bytecount ");Serial.println(bytecount);
+    for (int i = 0; i < bytecount; i++) {
+      readBuffer.rbyte[readPtr] = Wire.read();
+      Serial.println(readBuffer.rbyte[readPtr], HEX);
+      readPtr++;
+      if (readPtr >= 2) readPtr = 0;
+    }
+    break;
+  }
+  reads++;
 }
+/*
+ * On any request, send the current motor state structure to the ROSPI
+ */
+int wbPtr = 0;
+void sendMotorData()
+{
+  sprintf(debugText, "Sending %x : %d of %d\n", writeBuffer[wbPtr], wbPtr,
+    sizeof(motorData));
+  Serial.println(debugText);
+//  Serial.print("Sending "); Serial.print(writeBuffer[wbPtr],HEX);  
+//  Serial.print(" :");Serial.print(wbPtr); Serial.print(" of "); Serial.println(sizeof(motorData));
+  delay(100);
+  Wire.write(writeBuffer[wbPtr]);
+  if (wbPtr++ >= sizeof(motorData)) wbPtr = 0;
+}
+
+/*
+ * *********************
+ * Motor Control
+ * *********************
+ */
 /*
  * This section of the program concerns ths motors, and actually
  * sending commands to the motors/handling the interrupts and 
  * other stuff.
  */
 
-volatile byte motorLeftlast = 0;
-volatile byte motorRightlast = 0;
+volatile byte motorLeftLast = 0;
+volatile byte motorRightLast = 0;
 
 
 void motorSetup() {
@@ -252,17 +315,17 @@ void motorSetup() {
   rightMotor.write(OFF);
 
 // reset the counters that are sent back to the host
-  motorLeftCount = 0;
-  motorRightCount = 0;
-  leftThrottle = OFF;
-  rightThrottle = OFF;
+  motorData.motorLeftCount = 0;
+  motorData.motorRightCount = 0;
+  motorData.leftThrottle = OFF;
+  motorData.rightThrottle = OFF;
   
   // set up to receive the motor interrupts
-  pinMode(motorLeftCount, INPUT_PULLUP);
-  pinMode(motorRightCount, INPUT_PULLUP);
+  pinMode(LEFT_ENCODER, INPUT_PULLUP);
+  pinMode(RIGHT_ENCODER, INPUT_PULLUP);
 
-  attachInterrupt(0, isrLeft, CHANGE);
-  attachInterrupt(1, isrRight, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(LEFT_ENCODER), isrLeft, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(RIGHT_ENCODER), isrRight, CHANGE);
 }
 
 
@@ -272,11 +335,14 @@ void motorSetup() {
  * to the ROS host
  */
 void setSpeeds(const byte left_spd, const byte right_spd) {
-  leftThrottle = left_spd;
-  rightThrottle = right_spd;
+  motorData.leftThrottle = left_spd;
+  motorData.rightThrottle = right_spd;
   leftMotor.write(left_spd); 
   rightMotor.write(right_spd);
+  sprintf(debugText, "Speeds set [%d,%d]", left_spd, right_spd);
+  Serial.println(debugText);
 }
+
 /*
  * Convenience function to set both motors to the same speed
  */
@@ -285,16 +351,23 @@ void setSpeeds(const byte spd) {
 }
 
 /*
+ * ********************************
+ * Interrupt Service Routines
+ * ********************************
+ */
+
+/*
  * Interrupt service routine for motor 0 (int 0, pin 2)
  * isr0 is for the left motor
  */
 void isrLeft()
 {
   byte lstate = digitalRead(LEFT_ENCODER);
-  if ( (motorLeftlast == LOW)  &&  (lstate == HIGH)) { 
-      motorLeftCount++;
+  if ( (motorLeftLast == LOW)  &&  (lstate == HIGH)) { 
+      motorData.motorLeftCount++;
+    //  digitalWrite(LED_BUILTIN, HIGH);
   }
-  motorLeftlast = lstate;
+  motorLeftLast = lstate;
 }
 
 /*
@@ -304,8 +377,9 @@ void isrLeft()
 void isrRight()
 {
   byte lstate = digitalRead(RIGHT_ENCODER);
-  if ( (motorRightlast == LOW)  &&  (lstate == HIGH)) { 
-      motorRightCount++;
+  if ( (motorRightLast == LOW)  &&  (lstate == HIGH)) { 
+      motorData.motorRightCount++;
+   //   digitalWrite(LED_BUILTIN, HIGH);
   }
-  motorRightlast = lstate;
+  motorRightLast = lstate;
 }
