@@ -3,7 +3,10 @@
  * 
  * This sketch drives the on-board motor-control arduino.
  * 
- * V1.3   Hooked up I2C processing witpreliminary motor control
+ * Pin settings are based on the proto layout on the robot
+ * 
+ * V1.6   Debugging motor count reporting
+ * V1.7   Figure out left and right for the motors
  */
 #include <Servo.h>
 #include <Wire.h>
@@ -13,7 +16,7 @@
  * We may send this to the master as part of a data response.
  */
 const uint8_t MAJOR = 1;
-const uint8_t MINOR = 3;
+const uint8_t MINOR = 7;
 
 /*
  * For debugging, the speed of the serial connecion
@@ -28,14 +31,13 @@ const uint8_t  DEVICE_ADDRESS = 0x10;
 /*
  * Motor Stuff (related to specific UNO board in the robot
  */
-// Turns out MOTOR 1 is RIGHT and MOTOR 2 is LEFT
-const uint8_t   LEFT_MOTOR = 6;
-const uint8_t   RIGHT_MOTOR= 5;
+const uint8_t   LEFT_MOTOR = 5;
+const uint8_t   RIGHT_MOTOR= 6;
 
 // this is the pin for int 0
-const uint8_t  LEFT_ENCODER = 2;
+const uint8_t  LEFT_ENCODER = 3;
 // this is the pin for int 1   
-const uint8_t  RIGHT_ENCODER = 3;
+const uint8_t  RIGHT_ENCODER = 2;
 
 //
 // Empirically the limit seems to be:
@@ -55,12 +57,12 @@ const uint8_t OFF = 92;
  */
 const uint8_t THROTTLE_TABLE_SIZE = 4;
 const uint8_t REVERSE[THROTTLE_TABLE_SIZE] = {
-  OFF-CREEP_SPEED, OFF-SLOW_SPEED, 
-  OFF-NORMAL_SPEED, OFF-FAST_SPEED};
+  OFF+CREEP_SPEED, OFF+SLOW_SPEED, 
+  OFF+NORMAL_SPEED, OFF+FAST_SPEED};
 
 const uint8_t FORWARD[THROTTLE_TABLE_SIZE] = {
-  OFF+CREEP_SPEED, OFF+SLOW_SPEED, 
-  OFF+NORMAL_SPEED, OFF+FAST_SPEED}; 
+  OFF-CREEP_SPEED, OFF-SLOW_SPEED, 
+  OFF-NORMAL_SPEED, OFF-FAST_SPEED}; 
  
 /*
  * Motors actually appear as servos to the Arduiino
@@ -75,11 +77,14 @@ Servo rightMotor;
  */
 
 struct MotorDataStruct{
-volatile uint8_t  leftThrottle;
-volatile uint8_t  rightThrottle;
-volatile uint32_t motorLeftCount;
-volatile uint32_t motorRightCount;
-uint16_t  i2cmcVersion;
+  volatile uint32_t motorLeftCount;
+  volatile uint32_t motorRightCount;
+
+  volatile uint8_t  leftThrottle;
+  volatile uint8_t  rightThrottle;
+
+  uint8_t major = MAJOR;
+  uint8_t minor = MINOR;
 } motorData;
 
 /*
@@ -94,8 +99,6 @@ char debugText[60];
 
 void setup () {
   motorSetup();
-
-  motorData.i2cmcVersion = MAJOR<<8 + MINOR;
 
   // initialize digital pin RED as an output.
   // We will use this to indicate an error
@@ -128,7 +131,8 @@ uint16_t param16;
  A command of 255 is a NOP
  */
 void loop () {
-  digitalWrite(LED_BUILTIN, LOW);
+//  digitalWrite(LED_BUILTIN, LOW);
+  delay(250);
   switch(command) {
   case 255:
       /* NOP command. Do nothing*/
@@ -139,6 +143,8 @@ void loop () {
        *  Send off to both motors 
        */
       setSpeeds(OFF);
+      delay(500);       // allow time for motors to stop spinning (DEBUGGING)
+      printCounts();
       break;
 
   case 1:
@@ -165,13 +171,23 @@ void loop () {
      else   digitalWrite(LED_BUILTIN, HIGH);      // turn on error light
      break;
 
+ case 10:
+   /* Zero counters command
+    *  parameters ignored
+    */
+    // reset the counters that are sent back to the host
+    motorData.motorLeftCount = 0;
+    motorData.motorRightCount = 0;
+    break;
+    
  default:
    /*
-    * Here, it's an invaliud command
+    * Here, it's an invalid command
     * 
     * NEED BETTER ERROR HANDLING SOMEHOW
     */
      digitalWrite(LED_BUILTIN, HIGH);      // turn on error light   
+//     Serial.print("Bad command "); Serial.println(command);
   }
   // now set the command byte back to NOP
   command = 255;
@@ -181,9 +197,9 @@ void loop () {
  * Debug routine to print out the motor left and right counts
  */
 void printCounts() {
-  char line[40];
-  sprintf(line,"Counts  %d  %d", motorData.motorLeftCount, motorData.motorRightCount);
-  Serial.println(line);
+  Serial.print("Pulse counts ["); Serial.print(motorData.motorLeftCount, HEX);
+  Serial.print(","); Serial.print(motorData.motorRightCount, HEX);
+  Serial.println("]");
 }
 
 /*
@@ -281,14 +297,10 @@ void receiveData(int bytecount)
 int wbPtr = 0;
 void sendMotorData()
 {
-  sprintf(debugText, "Sending %x : %d of %d\n", writeBuffer[wbPtr], wbPtr,
-    sizeof(motorData));
-  Serial.println(debugText);
-//  Serial.print("Sending "); Serial.print(writeBuffer[wbPtr],HEX);  
-//  Serial.print(" :");Serial.print(wbPtr); Serial.print(" of "); Serial.println(sizeof(motorData));
+  Serial.print(" * "); Serial.println((uint8_t) writeBuffer[wbPtr], HEX);
   delay(100);
-  Wire.write(writeBuffer[wbPtr]);
-  if (wbPtr++ >= sizeof(motorData)) wbPtr = 0;
+  Wire.write(writeBuffer[wbPtr++]);
+  if (wbPtr >= sizeof(motorData)) wbPtr = 0;
 }
 
 /*
